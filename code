@@ -1,110 +1,122 @@
-import tensorflow as tf
-from tensorflow.keras.applications import Xception
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dropout, Dense
-from tensorflow.keras.models import Model
 import cv2
-import dlib
-import numpy as np
 import os
+import numpy as np
+import mediapipe as mp
+import tensorflow as tf  # Assuming you use TensorFlow for model loading
 
-# Function to preprocess a single frame
-def preprocess_frame(frame):
-    detector = dlib.get_frontal_face_detector()
-    faces = detector(frame)
-    if len(faces) > 0:
-        x, y, w, h = faces[0].left(), faces[0].top(), faces[0].width(), faces[0].height()
-        frame = frame[y:y+h, x:x+w]  # Crop the face
-    frame = cv2.resize(frame, (299, 299))  # Resize to 299x299
-    frame = frame.astype('float32') / 255.0  # Normalize pixel values
-    return frame
+# Initialize MediaPipe modules
+mp_pose = mp.solutions.pose
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
 
-# Function to load and preprocess a video
-def load_and_preprocess_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    frames = []
-    original_frames = []
+# Load trained model (e.g., a CNN) for NMF recognition
+model = tf.keras.models.load_model('/Users/pragatik/Desktop/pandas/sih/Dataset/A')  # Update with your model path
+
+# Function to preprocess image for model prediction
+def preprocess_image(image):
+    image_resized = cv2.resize(image, (224, 224))  # Resize to match model input size
+    image_normalized = image_resized / 255.0  # Normalize pixel values
+    return np.expand_dims(image_normalized, axis=0)  # Add batch dimension
+
+# Load dataset of images (if needed for reference or comparison)
+dataset_path = "path/to/your/dataset"  # Update this path
+dataset = {}
+for filename in os.listdir(dataset_path):
+    if filename.endswith(".jpg") or filename.endswith(".png"):
+        sign_name = filename.split('.')[0]  # Extract sign name from filename
+        img = cv2.imread(os.path.join(dataset_path, filename))
+        if img is not None:
+            dataset[sign_name] = img  # Store image in dataset dictionary
+
+# Image dimensions
+IMAGE_HEIGHT, IMAGE_WIDTH = 720, 1280
+
+# Capture video
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT)
+
+# Flag to track previous face recognition status
+face_recognized = False
+recognized_sign = ""
+
+# Setup Pose and Face Mesh models
+with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose, \
+     mp_face_mesh.FaceMesh(min_detection_confidence=0.5, min_tracking_confidence=0.5) as face_mesh:
+    
     while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+        success, frame = cap.read()
+        if not success:
+            print("Ignoring empty camera frame.")
+            continue
+
+        frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Pose estimation
+        pose_results = pose.process(frame_rgb)
+
+        # Face landmark detection
+        face_results = face_mesh.process(frame_rgb)
+
+        # Draw pose landmarks
+        if pose_results.pose_landmarks:
+            mp_drawing.draw_landmarks(
+                frame, 
+                pose_results.pose_landmarks, 
+                mp_pose.POSE_CONNECTIONS,
+                mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=4, circle_radius=4),  
+                mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=4, circle_radius=2))
+
+        # Check if face landmarks are detected
+        if face_results.multi_face_landmarks:
+            if not face_recognized:  # If the face was not recognized before
+                face_recognized = True
+                print("Face Recognized!")  # Print only once when recognized
+            # Draw the face landmarks
+            for face_landmarks in face_results.multi_face_landmarks:
+                mp_drawing.draw_landmarks(
+                    image=frame,
+                    landmark_list=face_landmarks,
+                    connections=mp_face_mesh.FACEMESH_CONTOURS,
+                    landmark_drawing_spec=mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),
+                    connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2))
+
+            # Extract face area for model prediction (optional preprocessing)
+            # You can modify this section to extract relevant NMF regions based on your model's input
+            face_roi = frame_rgb  # Replace this with the actual region of interest
+            preprocessed_face = preprocess_image(face_roi)
+
+            # Predict using the trained model
+            predictions = model.predict(preprocessed_face)
+            predicted_sign = np.argmax(predictions, axis=1)  # Assuming classification model
+
+            # Convert prediction index to label (this depends on how your model was trained)
+            recognized_sign = "SignLabel"  # Map predicted index to label, e.g., {0: 'Hello', 1: 'Thank You'}
+
+            # Show the recognized sign on the frame
+            if recognized_sign in dataset:
+                sign_image = dataset[recognized_sign]
+                sign_image_resized = cv2.resize(sign_image, (200, 200))  # Resize to fit
+                frame[50:250, 50:250] = sign_image_resized  # Place image on the frame
+                cv2.putText(frame, recognized_sign, (50, 300), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+
+        else:
+            if face_recognized:  # If the face was recognized previously but now not
+                face_recognized = False
+                print("Face Not Recognized!")  # Print only once when recognition stops
+            
+            # Show text message when face is not recognized
+            cv2.putText(frame, "Face Not Recognized", (50, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+
+        # Display the output frame
+        cv2.imshow('NMF Recognition - Pose and Face', frame)
+
+        if cv2.waitKey(5) & 0xFF == ord('q'):
             break
-        original_frames.append(frame)
-        frame = preprocess_frame(frame)
-        frames.append(frame)
-    cap.release()
-    return np.array(frames), original_frames
 
-# Function to build the model
-def build_model():
-    base_model = Xception(weights='imagenet', include_top=False, input_shape=(299, 299, 3))
-    x = GlobalAveragePooling2D()(base_model.output)
-    x = Dropout(0.5)(x)
-    x = Dense(1024, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    predictions = Dense(1, activation='sigmoid')(x)  # Binary classification (Real or Fake)
-    model = Model(inputs=base_model.input, outputs=predictions)
-    
-    # Compile the model
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-    return model
+cap.release()
+cv2.destroyAllWindows()
 
-# Function to save and display real and fake face images
-def save_and_display_face_images(original_frames, predictions, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    for i, (frame, prediction) in enumerate(zip(original_frames, predictions)):
-        label = 'Fake' if prediction > 0.5 else 'Real'
-        output_path = os.path.join(output_dir, f"{label}_frame_{i+1}.jpg")
-        cv2.imwrite(output_path, frame)
-        
-        # Display the image
-        cv2.imshow(f"{label}_frame_{i+1}", frame)
-        cv2.waitKey(500)  # Display each image for 500ms (adjust as needed)
-    
-    # Close all OpenCV windows
-    cv2.destroyAllWindows()
-    print(f"Saved face images to {output_dir}")
-
-# Function to display side-by-side videos if fake
-def display_side_by_side(original_frames, predictions):
-    for i, (frame, prediction) in enumerate(zip(original_frames, predictions)):
-        if prediction > 0.5:  # If the frame is classified as fake
-            # Create a side-by-side comparison
-            comparison_frame = np.hstack((frame, frame))
-            cv2.putText(comparison_frame, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(comparison_frame, "Fake", (frame.shape[1] + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
-            cv2.imshow(f"Comparison Frame {i+1}", comparison_frame)
-            cv2.waitKey(500)  # Display each comparison for 500ms (adjust as needed)
-    
-    # Close all OpenCV windows
-    cv2.destroyAllWindows()
-
-# Function to detect if the video is real or fake
-def detect_deepfake(video_path, model):
-    frames, original_frames = load_and_preprocess_video(video_path)
-    predictions = model.predict(frames)
-    avg_prediction = np.mean(predictions)
-    
-    # Save and display face images
-    output_dir = os.path.join("output_faces", os.path.basename(video_path).split('.')[0])
-    save_and_display_face_images(original_frames, predictions, output_dir)
-    
-    # If the video is classified as fake, display side-by-side comparisons
-    if avg_prediction > 0.5:
-        display_side_by_side(original_frames, predictions)
-        return "Fake"
-    else:
-        return "Real"
-
-# Main workflow to load a video and detect if it's real or fake
-if __name__ == "__main__":
-    model = build_model()
-    
-
-    while True:
-        video_path = input("Enter the path to the video file (or 'exit' to quit): ")
-        if video_path.lower() == 'exit':
-            break
-        try:
-            result = detect_deepfake(video_path, model)
-            print(f"The video is: {result}")
-        except Exception as e:
-            print(f"An error occurred: {e}. Please try again with a valid video file.")
